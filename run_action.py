@@ -13,6 +13,7 @@ import time
 
 import requests
 import yaml
+import pysnooper
 
 
 def get_diff_line_ranges_per_file(pr_files):
@@ -110,6 +111,7 @@ def get_pull_request_comments(
             yield item
 
 
+@pysnooper.snoop()
 def generate_review_comments(
     clang_tidy_fixes, repository_root, diff_line_ranges_per_file
 ):  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
