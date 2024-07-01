@@ -455,7 +455,6 @@ def dismiss_change_requests(
     repo,
     pull_request_id,
     warning_comment_prefix,
-    auto_resolve_conversations,
     single_comment_marker,
 ):  # pylint: disable=too-many-arguments
     """Dismissing stale Clang-Tidy requests for changes"""
@@ -505,15 +504,6 @@ def dismiss_change_requests(
 
         # Avoid triggering abuse detection
         time.sleep(10)
-
-    if auto_resolve_conversations:
-        resolve_conversations(
-            github_token=github_token,
-            repo=repo,
-            pull_request_id=pull_request_id,
-            github_api_timeout=github_api_timeout,
-            single_comment_marker=single_comment_marker,
-        )
 
 
 def conversation_threads_to_close(
@@ -577,7 +567,16 @@ def conversation_threads_to_close(
 
     # Iterate through review threads
     for thread in data["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
-        for comment in thread["comments"]["nodes"]:
+        comments = thread["comments"]["nodes"]
+
+        for comment in comments:
+            print(f"::debug::{comment['author']['login']}--{comment['body']}")
+            # someone other than the action has commented on the thread
+            other_commenter = any(
+                c["author"]["login"] != "github-actions"
+                for c in comments
+                if c["id"] != comment["id"]
+            )
             if (
                 comment["id"]
                 and thread["isResolved"] is False
@@ -585,6 +584,7 @@ def conversation_threads_to_close(
                 # which we get through the Rest API
                 and comment["author"]["login"] == "github-actions"
                 and comment_matcher.match(comment["body"].strip())
+                and not other_commenter
             ):
                 yield thread
                 break
@@ -631,7 +631,7 @@ def close_conversation(thread_id, github_token, github_api_timeout):
             if "Resource not accessible by integration" in error_msg
             else f"Closing conversation query failed: {error_msg}"
         )
-    print("Conversation closed successfully.")
+    print(f"::debug::Closed conversation thread: {thread_id}")
 
 
 def resolve_conversations(
@@ -730,6 +730,16 @@ def main():
         )
         clang_tidy_fixes = None
 
+    if args.auto_resolve_conversations == "true":
+        print("::debug::Resolving stale conversations from dismiss_change_requests")
+        resolve_conversations(
+            github_token=github_token,
+            repo=args.repository,
+            pull_request_id=args.pull_request_id,
+            github_api_timeout=github_api_timeout,
+            single_comment_marker=single_comment_marker,
+        )
+
     if (
         clang_tidy_fixes is None
         or "Diagnostics" not in clang_tidy_fixes
@@ -743,7 +753,6 @@ def main():
             args.repository,
             args.pull_request_id,
             warning_comment_prefix=warning_comment_prefix,
-            auto_resolve_conversations=args.auto_resolve_conversations == "true",
             single_comment_marker=single_comment_marker,
         )
         return 0
