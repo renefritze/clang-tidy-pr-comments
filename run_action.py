@@ -4,7 +4,6 @@
 
 import argparse
 import difflib
-import json
 import os
 import posixpath
 import re
@@ -13,6 +12,8 @@ import time
 
 import requests
 import yaml
+
+STATUS_OK = (200, 201, 202, 204, 205, 206, 207, 208, 226)
 
 
 def get_diff_line_ranges_per_file(pr_files):
@@ -61,25 +62,18 @@ def get_pull_request_files(
 ):
     """Generator of GitHub metadata about files modified by the processed PR"""
 
-    # Request a maximum of 100 pages (3000 items)
-    for page in range(1, 101):
-        result = requests.get(
-            f"{github_api_url}/repos/{repo}/pulls/{pull_request_id:d}/files?page={page:d}",
-            headers={
-                "Accept": "application/vnd.github.v3+json",
-                "Authorization": f"token {github_token}",
-            },
-            timeout=github_api_timeout,
-        )
+    response = _rest_request(
+        f"{github_api_url}/repos/{repo}/pulls/{pull_request_id:d}/files",
+        token=github_token,
+        timeout=github_api_timeout,
+    )
+    chunk = response.json()
+    while "next" in response.links:
+        url = response.links["next"]["url"]
+        response = _rest_request(url, token=github_token, timeout=github_api_timeout)
+        chunk.extend(response.json())
 
-        assert result.status_code == requests.codes.ok  # pylint: disable=no-member
-
-        chunk = json.loads(result.text)
-
-        if not chunk:
-            break
-
-        yield from chunk
+    yield from chunk
 
 
 def get_pull_request_comments(
@@ -87,25 +81,18 @@ def get_pull_request_comments(
 ):
     """Generator of GitHub metadata about comments to the processed PR"""
 
-    # Request a maximum of 100 pages (3000 items)
-    for page in range(1, 101):
-        result = requests.get(
-            f"{github_api_url}/repos/{repo}/pulls/{pull_request_id:d}/comments?page={page:d}",
-            headers={
-                "Accept": "application/vnd.github.v3+json",
-                "Authorization": f"token {github_token}",
-            },
-            timeout=github_api_timeout,
-        )
+    response = _rest_request(
+        f"{github_api_url}/repos/{repo}/pulls/{pull_request_id:d}/comments",
+        token=github_token,
+        timeout=github_api_timeout,
+    )
+    chunk = response.json()
+    while "next" in response.links:
+        url = response.links["next"]["url"]
+        response = _rest_request(url, token=github_token, timeout=github_api_timeout)
+        chunk.extend(response.json())
 
-        assert result.status_code == requests.codes.ok  # pylint: disable=no-member
-
-        chunk = json.loads(result.text)
-
-        if not chunk:
-            break
-
-        yield from chunk
+    yield from chunk
 
 
 def generate_review_comments(
@@ -455,24 +442,31 @@ def dismiss_change_requests(
     repo,
     pull_request_id,
     warning_comment_prefix,
-    single_comment_marker,
 ):  # pylint: disable=too-many-arguments
     """Dismissing stale Clang-Tidy requests for changes"""
 
     print("Checking if there are any stale requests for changes to dismiss...")
-
-    result = requests.get(
+    result = _rest_request(
         f"{github_api_url}/repos/{repo}/pulls/{pull_request_id:d}/reviews",
-        headers={
-            "Accept": "application/vnd.github.v3+json",
-            "Authorization": f"token {github_token}",
-        },
+        token=github_token,
         timeout=github_api_timeout,
     )
 
     assert result.status_code == requests.codes.ok  # pylint: disable=no-member
 
-    reviews = json.loads(result.text)
+    reviews = result.json()
+
+    # paginated reviews
+    while "next" in result.links:
+        result = requests.get(
+            result.links["next"]["url"],
+            headers={
+                "Accept": "application/vnd.github.v3+json",
+                "Authorization": f"token {github_token}",
+            },
+            timeout=github_api_timeout,
+        )
+        reviews.extend(result.json())
 
     # Dismiss only our own reviews
     reviews_to_dismiss = [
@@ -516,12 +510,18 @@ def conversation_threads_to_close(
     """
 
     repo_owner, repo_name = repo.split("/")
-    query = """
+    query_tpl = """
     query {
       repository(owner: "%s", name: "%s") {
         pullRequest(number: %d) {
           id
-          reviewThreads(last: 100) {
+          reviewThreads(first: 100, after: "%s") {
+           pageInfo {
+                endCursor
+                startCursor
+                hasNextPage
+                hasPreviousPage
+            }
             nodes {
               id
               isResolved
@@ -539,12 +539,9 @@ def conversation_threads_to_close(
         }
       }
     }
-    """ % (
-        repo_owner,
-        repo_name,
-        pr_number,
-    )
+    """
 
+    query = query_tpl % (repo_owner, repo_name, pr_number, "null")
     response = requests.post(
         "https://api.github.com/graphql",
         json={"query": query},
@@ -552,13 +549,31 @@ def conversation_threads_to_close(
         timeout=github_api_timeout,
     )
 
-    if response.status_code != 200:
-        print(
-            f"::error::getting unresolved conversation threads: {response.status_code}"
+    data = _check_graphql_response(response, query)
+    threads = data["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+    while data["data"]["repository"]["pullRequest"]["reviewThreads"]["pageInfo"][
+        "hasNextPage"
+    ]:
+        cursor = data["data"]["repository"]["pullRequest"]["reviewThreads"]["pageInfo"][
+            "endCursor"
+        ]
+        query = query_tpl % (
+            repo_owner,
+            repo_name,
+            pr_number,
+            cursor,
         )
-        raise RuntimeError("Failed to get unresolved conversation threads.")
+        response = requests.post(
+            "https://api.github.com/graphql",
+            json={"query": query},
+            headers={"Authorization": "Bearer " + github_token},
+            timeout=github_api_timeout,
+        )
+        data = response.json()
+        threads.extend(
+            data["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+        )
 
-    data = response.json()
     # a regex that matches the start of a single comment
     single_comment_marker = re.escape(single_comment_marker)
     comment_matcher = re.compile(
@@ -566,7 +581,7 @@ def conversation_threads_to_close(
     )
 
     # Iterate through review threads
-    for thread in data["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
+    for thread in threads:
         comments = thread["comments"]["nodes"]
 
         for comment in comments:
@@ -731,7 +746,6 @@ def main():
         clang_tidy_fixes = None
 
     if args.auto_resolve_conversations == "true":
-        print("::debug::Resolving stale conversations from dismiss_change_requests")
         resolve_conversations(
             github_token=github_token,
             repo=args.repository,
@@ -753,7 +767,6 @@ def main():
             args.repository,
             args.pull_request_id,
             warning_comment_prefix=warning_comment_prefix,
-            single_comment_marker=single_comment_marker,
         )
         return 0
 
@@ -813,6 +826,38 @@ def main():
     )
 
     return 0
+
+
+def _check_graphql_response(response: requests.Response, query: str) -> dict:
+    if response.status_code not in STATUS_OK:
+        msg = f"Error in GraphQL request. Status code: {response.status_code}\n {response.text}\n\nQuery\n{query}"
+        raise RuntimeError(msg)
+    data = response.json()
+    if "errors" not in data:
+        return data
+    for error in data["errors"]:
+        locations = error.get("locations", [])
+        message = error.get("message", "")
+        print(f"Error: {message}")
+        for location in locations:
+            print(f"Line {location['line']}, column {location['column']}")
+    raise RuntimeError("Error in GraphQL response")
+
+
+def _rest_request(url: str, token: str, timeout: int) -> requests.Response:
+    response = requests.get(url, headers=_headers(token), timeout=timeout)
+    if response.status_code not in STATUS_OK:
+        raise RuntimeError(
+            f"Request failed on {url}. Status code: {response.status_code}\n{response.text}"
+        )
+    return response
+
+
+def _headers(token: str):
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
 
 
 if __name__ == "__main__":
